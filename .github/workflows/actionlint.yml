@@ -1,11 +1,10 @@
 ---
-name: Lint GitHub Actions workflows
+name: Lint GitHub Actions
+run-name: Lint GitHub Actions
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
   workflow_dispatch:
 
 permissions:
