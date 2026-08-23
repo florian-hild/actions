@@ -1,6 +1,6 @@
 ---
-
 name: release
+run-name: Release action version
 
 # Repository-wide release tagging. Every push to main that touches an action
 # publishes three tags at once:
