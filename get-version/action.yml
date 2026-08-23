@@ -1,0 +1,189 @@
+name: Get Version
+description: Calculate semantic version based on git tags and commits
+
+inputs:
+  change_path:
+    description: 'Path to check for changes'
+    required: false
+    default: '.'
+  tag_pattern:
+    description: 'Tag pattern to search for'
+    required: false
+    default: 'v'
+  bump_version:
+    description: 'Force version bump even if no changes detected (true/false)'
+    required: false
+    default: 'false'
+  version_line:
+    description: 'Pin to a specific major line (numeric, e.g. "2"): tag lookup is restricted to `<tag_pattern><version_line>.*` and a (MAJOR) bump is rejected, so a maintenance branch keeps releasing on its own major. (MINOR)/patch bumps still apply. Empty = highest tag matching tag_pattern (previous behavior).'
+    required: false
+    default: ''
+
+outputs:
+  version:
+    description: "Semantic version"
+    value: ${{ steps.semver.outputs.version }}
+  major:
+    description: "Major version"
+    value: ${{ steps.semver.outputs.major }}
+  minor:
+    description: "Minor version"
+    value: ${{ steps.semver.outputs.minor }}
+  patch:
+    description: "Patch version"
+    value: ${{ steps.semver.outputs.patch }}
+  changed:
+    description: "Whether files changed"
+    value: ${{ steps.semver.outputs.changed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Calculate Semantic Version
+      id: semver
+      env:
+        CHANGE_PATH: ${{ inputs.change_path }}
+        TAG_PATTERN: ${{ inputs.tag_pattern }}
+        BUMP_VERSION: ${{ inputs.bump_version }}
+        VERSION_LINE: ${{ inputs.version_line }}
+      shell: bash
+      run: |
+        #!/bin/bash
+        set -e
+
+        echo "=== Checking for changes in ${CHANGE_PATH} ==="
+
+        if [ "${{ github.event_name }}" == "pull_request" ]; then
+          BASE_COMMIT="${{ github.event.pull_request.base.sha }}"
+          HEAD_COMMIT="${{ github.event.pull_request.head.sha }}"
+        else
+          if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+            BASE_COMMIT=""
+          else
+            BASE_COMMIT="${{ github.event.before }}"
+          fi
+          HEAD_COMMIT="${{ github.sha }}"
+        fi
+
+        if [ -z "$BASE_COMMIT" ]; then
+          CHANGED_FILES=$(git ls-files "${CHANGE_PATH}" | wc -l)
+        else
+          CHANGED_FILES=$(git diff --name-only ${BASE_COMMIT} ${HEAD_COMMIT} -- "${CHANGE_PATH}" | wc -l)
+        fi
+
+        echo "Changed files in ${CHANGE_PATH}: ${CHANGED_FILES}"
+
+        if [ "$BUMP_VERSION" == "false" ] && [ "$CHANGED_FILES" -eq 0 ]; then
+          echo "No changes detected in ${CHANGE_PATH}"
+          echo "changed=false" >> $GITHUB_OUTPUT
+          echo "version=" >> $GITHUB_OUTPUT
+          echo "major=" >> $GITHUB_OUTPUT
+          echo "minor=" >> $GITHUB_OUTPUT
+          echo "patch=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        echo "changed=true" >> $GITHUB_OUTPUT
+
+        # When version_line is set, restrict the lookup to that major line so a
+        # maintenance branch keeps releasing patches on its own major instead of
+        # jumping to a newer major released on another branch. Empty preserves
+        # the previous behavior (highest tag matching the pattern).
+        if [ -n "$VERSION_LINE" ]; then
+          # Guard: version_line is interpolated into the tag glob, so it must be
+          # a plain numeric major (no wildcards / unexpected matches).
+          if ! [[ "$VERSION_LINE" =~ ^[0-9]+$ ]]; then
+            echo "::error::version_line must be a numeric major version (got '${VERSION_LINE}')"
+            exit 1
+          fi
+          LAST_TAG=$(git tag -l "${TAG_PATTERN}${VERSION_LINE}.*" | sort -V | tail -n 1)
+        else
+          LAST_TAG=$(git tag -l "${TAG_PATTERN}*" | sort -V | tail -n 1)
+        fi
+
+        if [ -z "$LAST_TAG" ]; then
+          # No tag yet: seed the pinned line at <version_line>.0.0 so the first
+          # release lands on the intended major (0.0.0 when unpinned, as before).
+          CURRENT_VERSION="${VERSION_LINE:-0}.0.0"
+          echo "No existing tag found, starting with ${CURRENT_VERSION}"
+        else
+          echo "Found last tag: ${LAST_TAG}"
+          CURRENT_VERSION=${LAST_TAG#"${TAG_PATTERN}"}
+        fi
+
+        echo "Current version: ${CURRENT_VERSION}"
+
+        IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+        MAJOR=${MAJOR#v}
+
+        # Determine the highest version bump across all commits
+        # Priority: MAJOR > MINOR > PATCH (default)
+        BUMP_TYPE="PATCH"
+
+        # For schedule and workflow_dispatch events, always use PATCH bump and skip commit analysis
+        if [ "${{ github.event_name }}" == "schedule" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "Event type is ${{ github.event_name }} - forcing PATCH bump and skipping commit message analysis"
+          BUMP_TYPE="PATCH"
+        else
+          echo "=== Analyzing commit messages ==="
+
+          # Get all commits to analyze
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # For PRs, get all commits between base and head
+            COMMIT_MESSAGES=$(git log --pretty=%B ${BASE_COMMIT}..${HEAD_COMMIT})
+          else
+            # For pushes, analyze commits in the range
+            if [ -z "$BASE_COMMIT" ]; then
+              # First push, analyze all commits
+              COMMIT_MESSAGES=$(git log --pretty=%B ${HEAD_COMMIT})
+            else
+              COMMIT_MESSAGES=$(git log --pretty=%B ${BASE_COMMIT}..${HEAD_COMMIT})
+            fi
+          fi
+
+          echo "Commit messages to analyze:"
+          echo "${COMMIT_MESSAGES}"
+          echo ""
+          echo "== End of commit messages =="
+
+          if echo "$COMMIT_MESSAGES" | grep -q "(MAJOR)"; then
+            echo "MAJOR version bump detected in commits"
+            BUMP_TYPE="MAJOR"
+          elif echo "$COMMIT_MESSAGES" | grep -q "(MINOR)"; then
+            echo "MINOR version bump detected in commits"
+            BUMP_TYPE="MINOR"
+          else
+            echo "PATCH version bump (default)"
+            BUMP_TYPE="PATCH"
+          fi
+        fi
+
+        # A pinned line must stay on its major; a (MAJOR) bump would leave it.
+        if [ -n "$VERSION_LINE" ] && [ "$BUMP_TYPE" == "MAJOR" ]; then
+          echo "::error::(MAJOR) detected while version_line is pinned to ${VERSION_LINE}; a major bump would leave the pinned line. Drop the pin or the (MAJOR) marker."
+          exit 1
+        fi
+
+        echo "Selected bump type: ${BUMP_TYPE}"
+
+        # Apply the version bump
+        if [ "$BUMP_TYPE" == "MAJOR" ]; then
+          MAJOR=$((MAJOR + 1))
+          MINOR=0
+          PATCH=0
+        elif [ "$BUMP_TYPE" == "MINOR" ]; then
+          MINOR=$((MINOR + 1))
+          PATCH=0
+        else
+          PATCH=$((PATCH + 1))
+        fi
+
+        NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+
+        echo "=== Version Information ==="
+        echo "New version: ${NEW_VERSION}"
+
+        echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+        echo "major=${MAJOR}" >> $GITHUB_OUTPUT
+        echo "minor=${MINOR}" >> $GITHUB_OUTPUT
+        echo "patch=${PATCH}" >> $GITHUB_OUTPUT
