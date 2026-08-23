@@ -1,4 +1,4 @@
-name: Detect Path Changes
+name: Path Changes
 description: |
   Detects whether changed files match specified path groups and writes a boolean
   output per group plus a combined 'results' JSON output.
@@ -87,12 +87,35 @@ runs:
             return "^" + result + "$"
 
 
+        def require_github_output() -> str:
+            """Fail with a readable message when run outside GitHub Actions."""
+            path = os.environ.get("GITHUB_OUTPUT", "")
+            if not path:
+                raise SystemExit("::error::GITHUB_OUTPUT is not set")
+            return path
+
+
         def any_file_matches(files: list, patterns: list) -> bool:
             compiled = [re.compile(glob_to_regex(p)) for p in patterns]
             return any(rx.match(f) for f in files for rx in compiled)
 
 
         paths_config: dict = json.loads(os.environ["ACTION_PATHS"])
+
+        # Group names become output keys. "results" is taken by this action's
+        # own JSON output, and anything with a newline could inject further
+        # outputs, so both are rejected instead of silently colliding.
+        RESERVED = {"results"}
+        for group in paths_config:
+            if group in RESERVED:
+                raise SystemExit(
+                    f"::error::group name '{group}' is reserved by this action"
+                )
+            if not group or any(c in group for c in "\r\n=") or group.strip() != group:
+                raise SystemExit(
+                    f"::error::group name {group!r} must not be empty or contain "
+                    "newlines, '=' or surrounding whitespace"
+                )
         base_ref: str = os.environ.get("ACTION_BASE_REF", "").strip()
 
         event_name: str = os.environ.get("GITHUB_EVENT_NAME", "")
@@ -121,7 +144,7 @@ runs:
             else:
                 print("::warning::Could not determine base ref — marking all groups as changed.")
 
-            github_output = os.environ.get("GITHUB_OUTPUT", "")
+            github_output = require_github_output()
             results = {group: True for group in paths_config}
             with open(github_output, "a") as fh:
                 for group in paths_config:
@@ -168,7 +191,7 @@ runs:
         for f in changed_files:
             print(f"  {f}")
 
-        github_output = os.environ.get("GITHUB_OUTPUT", "")
+        github_output = require_github_output()
         results: dict = {}
 
         with open(github_output, "a") as fh:

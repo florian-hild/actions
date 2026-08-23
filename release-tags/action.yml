@@ -1,0 +1,109 @@
+name: Release Tags
+description: >-
+  Publish one immutable and two floating tags for a semantic version, so
+  consumers can pin either an exact release or a moving major/minor line.
+
+inputs:
+  version:
+    description: 'Semantic version to publish, e.g. "1.4.2".'
+    required: true
+  tag_prefix:
+    description: >-
+      Prefix in front of the version. "v" yields v1.4.2 / v1.4 / v1. Use a
+      per-component prefix such as "my-action-v" when one repository releases
+      several independently versioned things.
+    required: false
+    default: 'v'
+  dry_run:
+    description: 'Print what would be tagged and pushed, change nothing.'
+    required: false
+    default: 'false'
+
+outputs:
+  full:
+    description: 'The immutable tag, e.g. v1.4.2'
+    value: ${{ steps.publish.outputs.full }}
+  minor:
+    description: 'The floating minor tag, e.g. v1.4'
+    value: ${{ steps.publish.outputs.minor }}
+  major:
+    description: 'The floating major tag, e.g. v1'
+    value: ${{ steps.publish.outputs.major }}
+
+runs:
+  using: composite
+  steps:
+    - name: Publish tags
+      id: publish
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        TAG_PREFIX: ${{ inputs.tag_prefix }}
+        DRY_RUN: ${{ inputs.dry_run }}
+      run: |
+        set -euo pipefail
+
+        if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error::version must be MAJOR.MINOR.PATCH, got '${VERSION}'"
+          exit 1
+        fi
+
+        IFS='.' read -r major_num minor_num _ <<< "$VERSION"
+
+        full="${TAG_PREFIX}${VERSION}"
+        minor="${TAG_PREFIX}${major_num}.${minor_num}"
+        major="${TAG_PREFIX}${major_num}"
+
+        {
+          echo "full=${full}"
+          echo "minor=${minor}"
+          echo "major=${major}"
+        } >> "$GITHUB_OUTPUT"
+
+        # Tags are only visible to `git tag -l` when they were fetched. On a
+        # shallow or tagless checkout the existence check below would pass by
+        # accident and a released version could be silently rewritten.
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "::error::shallow checkout - use actions/checkout with fetch-depth: 0"
+          exit 1
+        fi
+
+        # The full version is immutable: it is what people pin for exact
+        # reproducibility. Refusing here is the point.
+        if git rev-parse -q --verify "refs/tags/${full}" >/dev/null; then
+          echo "::error::${full} already exists and will not be overwritten"
+          exit 1
+        fi
+
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "Dry run - would publish ${full}, ${minor}, ${major} at ${GITHUB_SHA}"
+          {
+            echo "### Dry run"
+            echo ""
+            echo "Would publish \`${full}\`, \`${minor}\` and \`${major}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        git tag --annotate "$full" -m "Release ${VERSION}"
+        git tag --annotate --force "$minor" -m "Release ${VERSION}"
+        git tag --annotate --force "$major" -m "Release ${VERSION}"
+
+        # The floating tags move backwards as well as forwards, so they need
+        # --force on the remote too.
+        git push origin "$full"
+        git push --force origin "$minor"
+        git push --force origin "$major"
+
+        {
+          echo "### Release ${VERSION}"
+          echo ""
+          echo "| Tag | Points at | Moves |"
+          echo "|---|---|---|"
+          echo "| \`${full}\` | \`${GITHUB_SHA::7}\` | never |"
+          echo "| \`${minor}\` | \`${GITHUB_SHA::7}\` | with every patch |"
+          echo "| \`${major}\` | \`${GITHUB_SHA::7}\` | with every compatible release |"
+        } >> "$GITHUB_STEP_SUMMARY"

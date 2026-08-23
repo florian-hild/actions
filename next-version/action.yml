@@ -1,5 +1,5 @@
-name: Get Version
-description: Calculate semantic version based on git tags and commits
+name: Next Version
+description: Calculate the next semantic version from git tags and commit messages
 
 inputs:
   change_path:
@@ -46,45 +46,65 @@ runs:
         TAG_PATTERN: ${{ inputs.tag_pattern }}
         BUMP_VERSION: ${{ inputs.bump_version }}
         VERSION_LINE: ${{ inputs.version_line }}
+        # Passed through the environment rather than interpolated into the
+        # script body: expression results must never become shell syntax.
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        HEAD_SHA: ${{ github.sha }}
       shell: bash
       run: |
         #!/bin/bash
-        set -e
+        set -euo pipefail
+
+        # Without full history `git tag -l` finds nothing, the action would
+        # silently restart at 0.0.1 and overwrite a released version.
+        if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+          echo "::error::shallow checkout - use actions/checkout with fetch-depth: 0"
+          exit 1
+        fi
 
         echo "=== Checking for changes in ${CHANGE_PATH} ==="
 
-        if [ "${{ github.event_name }}" == "pull_request" ]; then
-          BASE_COMMIT="${{ github.event.pull_request.base.sha }}"
-          HEAD_COMMIT="${{ github.event.pull_request.head.sha }}"
+        if [ "$EVENT_NAME" == "pull_request" ]; then
+          BASE_COMMIT="$PR_BASE_SHA"
+          HEAD_COMMIT="$PR_HEAD_SHA"
         else
-          if [ "${{ github.event.before }}" == "0000000000000000000000000000000000000000" ]; then
+          if [ "$PUSH_BEFORE" == "0000000000000000000000000000000000000000" ]; then
             BASE_COMMIT=""
           else
-            BASE_COMMIT="${{ github.event.before }}"
+            BASE_COMMIT="$PUSH_BEFORE"
           fi
-          HEAD_COMMIT="${{ github.sha }}"
+          HEAD_COMMIT="$HEAD_SHA"
         fi
 
         if [ -z "$BASE_COMMIT" ]; then
           CHANGED_FILES=$(git ls-files "${CHANGE_PATH}" | wc -l)
         else
-          CHANGED_FILES=$(git diff --name-only ${BASE_COMMIT} ${HEAD_COMMIT} -- "${CHANGE_PATH}" | wc -l)
+          CHANGED_FILES=$(git diff --name-only "${BASE_COMMIT}" "${HEAD_COMMIT}" -- "${CHANGE_PATH}" | wc -l)
         fi
 
         echo "Changed files in ${CHANGE_PATH}: ${CHANGED_FILES}"
 
         if [ "$BUMP_VERSION" == "false" ] && [ "$CHANGED_FILES" -eq 0 ]; then
           echo "No changes detected in ${CHANGE_PATH}"
-          echo "changed=false" >> $GITHUB_OUTPUT
-          echo "version=" >> $GITHUB_OUTPUT
-          echo "major=" >> $GITHUB_OUTPUT
-          echo "minor=" >> $GITHUB_OUTPUT
-          echo "patch=" >> $GITHUB_OUTPUT
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          echo "version=" >> "$GITHUB_OUTPUT"
+          echo "major=" >> "$GITHUB_OUTPUT"
+          echo "minor=" >> "$GITHUB_OUTPUT"
+          echo "patch=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        echo "changed=true" >> $GITHUB_OUTPUT
+        echo "changed=true" >> "$GITHUB_OUTPUT"
 
+        # The glob requires three dot-separated parts on purpose. This repo also
+        # publishes floating "<pattern><major>" and "<pattern><major>.<minor>"
+        # tags next to the full ones; without the constraint `sort -V | tail -1`
+        # could return e.g. "v2", and splitting that on "." would leave MINOR
+        # and PATCH empty and break the arithmetic below.
+        #
         # When version_line is set, restrict the lookup to that major line so a
         # maintenance branch keeps releasing patches on its own major instead of
         # jumping to a newer major released on another branch. Empty preserves
@@ -96,9 +116,9 @@ runs:
             echo "::error::version_line must be a numeric major version (got '${VERSION_LINE}')"
             exit 1
           fi
-          LAST_TAG=$(git tag -l "${TAG_PATTERN}${VERSION_LINE}.*" | sort -V | tail -n 1)
+          LAST_TAG=$(git tag -l "${TAG_PATTERN}${VERSION_LINE}.*.*" | sort -V | tail -n 1)
         else
-          LAST_TAG=$(git tag -l "${TAG_PATTERN}*" | sort -V | tail -n 1)
+          LAST_TAG=$(git tag -l "${TAG_PATTERN}*.*.*" | sort -V | tail -n 1)
         fi
 
         if [ -z "$LAST_TAG" ]; then
@@ -116,40 +136,51 @@ runs:
         IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
         MAJOR=${MAJOR#v}
 
+        # A malformed tag would otherwise reach the arithmetic below and fail
+        # with a message that says nothing about the actual cause.
+        for part in "$MAJOR" "$MINOR" "$PATCH"; do
+          if ! [[ "$part" =~ ^[0-9]+$ ]]; then
+            echo "::error::tag '${LAST_TAG}' does not parse as MAJOR.MINOR.PATCH"
+            exit 1
+          fi
+        done
+
         # Determine the highest version bump across all commits
         # Priority: MAJOR > MINOR > PATCH (default)
         BUMP_TYPE="PATCH"
 
         # For schedule and workflow_dispatch events, always use PATCH bump and skip commit analysis
-        if [ "${{ github.event_name }}" == "schedule" ] || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-          echo "Event type is ${{ github.event_name }} - forcing PATCH bump and skipping commit message analysis"
+        if [ "$EVENT_NAME" == "schedule" ] || [ "$EVENT_NAME" == "workflow_dispatch" ]; then
+          echo "Event type is ${EVENT_NAME} - forcing PATCH bump and skipping commit message analysis"
           BUMP_TYPE="PATCH"
         else
           echo "=== Analyzing commit messages ==="
 
           # Get all commits to analyze
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
+          if [ "$EVENT_NAME" == "pull_request" ]; then
             # For PRs, get all commits between base and head
-            COMMIT_MESSAGES=$(git log --pretty=%B ${BASE_COMMIT}..${HEAD_COMMIT})
+            COMMIT_SUBJECTS=$(git log --pretty=%s "${BASE_COMMIT}..${HEAD_COMMIT}")
           else
             # For pushes, analyze commits in the range
             if [ -z "$BASE_COMMIT" ]; then
               # First push, analyze all commits
-              COMMIT_MESSAGES=$(git log --pretty=%B ${HEAD_COMMIT})
+              COMMIT_SUBJECTS=$(git log --pretty=%s "${HEAD_COMMIT}")
             else
-              COMMIT_MESSAGES=$(git log --pretty=%B ${BASE_COMMIT}..${HEAD_COMMIT})
+              COMMIT_SUBJECTS=$(git log --pretty=%s "${BASE_COMMIT}..${HEAD_COMMIT}")
             fi
           fi
 
-          echo "Commit messages to analyze:"
-          echo "${COMMIT_MESSAGES}"
+          echo "Commit subjects to analyze:"
+          echo "${COMMIT_SUBJECTS}"
           echo ""
-          echo "== End of commit messages =="
+          echo "== End of commit subjects =="
 
-          if echo "$COMMIT_MESSAGES" | grep -q "(MAJOR)"; then
+          # Subjects only (%s, not %B): a body mentioning "(MINOR)" in prose -
+          # a revert note, a quoted message - must not move the version.
+          if echo "$COMMIT_SUBJECTS" | grep -q "(MAJOR)"; then
             echo "MAJOR version bump detected in commits"
             BUMP_TYPE="MAJOR"
-          elif echo "$COMMIT_MESSAGES" | grep -q "(MINOR)"; then
+          elif echo "$COMMIT_SUBJECTS" | grep -q "(MINOR)"; then
             echo "MINOR version bump detected in commits"
             BUMP_TYPE="MINOR"
           else
@@ -183,7 +214,7 @@ runs:
         echo "=== Version Information ==="
         echo "New version: ${NEW_VERSION}"
 
-        echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
-        echo "major=${MAJOR}" >> $GITHUB_OUTPUT
-        echo "minor=${MINOR}" >> $GITHUB_OUTPUT
-        echo "patch=${PATCH}" >> $GITHUB_OUTPUT
+        echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
+        echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
+        echo "patch=${PATCH}" >> "$GITHUB_OUTPUT"
