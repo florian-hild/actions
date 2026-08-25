@@ -54,8 +54,6 @@ jobs:
         with:
           bump_version: "true"
 
-      # floating_tags: consumers pin "@v1", so this repository is one of the
-      # few that needs the moving major/minor tags. They are off by default.
       - name: Publish tags
         uses: ./release-tags
         with:
