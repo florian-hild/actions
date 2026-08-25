@@ -1,6 +1,7 @@
 # release-tags
 
-Publish one immutable and two floating tags for a semantic version.
+Publish the immutable tag for a semantic version, and with `floating_tags` the
+two floating major/minor tags next to it.
 
 ## Required checkout settings
 
@@ -50,6 +51,28 @@ with:
 
 This would create tags like `my-action-1.4.2`, `my-action-1.4`, and `my-action-1`.
 
+### `floating_tags`
+
+Default: `false`
+
+Publish the floating `<prefix><major>` and `<prefix><major>.<minor>` tags next
+to the immutable full one:
+
+```yaml
+with:
+  floating_tags: "true" # v1.4.2, v1.4 and v1
+```
+
+Off by default, because most releases are deployed by exact version and a
+repository releasing several components would otherwise carry two moving tags
+per component. Turn it on where consumers pin a moving line - the way the
+actions in this repository are consumed as `@v1`.
+
+While off, the `minor` and `major` outputs are empty, so nothing can pin a tag
+that was never published. `next-version` is unaffected either way: it looks
+for tags with three dot-separated parts and therefore never reads the floating
+ones.
+
 ### `dry_run`
 
 Default: `false`
@@ -71,11 +94,11 @@ The immutable full tag, for example `v1.4.2`.
 
 ### `minor`
 
-The floating minor tag, for example `v1.4`.
+The floating minor tag, for example `v1.4`. Empty when `floating_tags` is off.
 
 ### `major`
 
-The floating major tag, for example `v1`.
+The floating major tag, for example `v1`. Empty when `floating_tags` is off.
 
 ## Minimal example
 

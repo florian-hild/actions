@@ -58,3 +58,4 @@ jobs:
         uses: ./release-tags
         with:
           version: ${{ steps.version.outputs.version }}
+          floating_tags: "true"
