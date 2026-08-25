@@ -3,7 +3,7 @@
 | Action | Purpose |
 |---|---|
 | [`next-version`](next-version/) | Derive the next semantic version from git tags and commit subjects |
-| [`release-tags`](release-tags/) | Publish one immutable and two floating tags for a version |
+| [`release-tags`](release-tags/) | Publish the immutable tag for a version, and optionally the floating ones |
 | [`path-changes`](path-changes/) | Report which path groups a push or pull request touched |
 
 ## Versioning

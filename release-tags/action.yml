@@ -1,7 +1,8 @@
 name: Release Tags
 description: >-
-  Publish one immutable and two floating tags for a semantic version, so
-  consumers can pin either an exact release or a moving major/minor line.
+  Publish an immutable tag for a semantic version, optionally next to the two
+  floating major/minor tags, so consumers can pin either an exact release or a
+  moving line.
 
 inputs:
   version:
@@ -14,6 +15,16 @@ inputs:
       several independently versioned things.
     required: false
     default: 'v'
+  floating_tags:
+    description: >-
+      Publish the floating "<prefix><major>" and "<prefix><major>.<minor>"
+      tags next to the immutable full one. Off by default: most releases are
+      deployed by exact version, and a repository releasing several
+      components would otherwise carry two moving tags per component. Turn it
+      on where consumers pin a moving line, the way this repository's own
+      actions are consumed as "@v1".
+    required: false
+    default: 'false'
   dry_run:
     description: 'Print what would be tagged and pushed, change nothing.'
     required: false
@@ -24,10 +35,10 @@ outputs:
     description: 'The immutable tag, e.g. v1.4.2'
     value: ${{ steps.publish.outputs.full }}
   minor:
-    description: 'The floating minor tag, e.g. v1.4'
+    description: 'The floating minor tag, e.g. v1.4. Empty unless floating_tags is on.'
     value: ${{ steps.publish.outputs.minor }}
   major:
-    description: 'The floating major tag, e.g. v1'
+    description: 'The floating major tag, e.g. v1. Empty unless floating_tags is on.'
     value: ${{ steps.publish.outputs.major }}
 
 runs:
@@ -39,6 +50,7 @@ runs:
       env:
         VERSION: ${{ inputs.version }}
         TAG_PREFIX: ${{ inputs.tag_prefix }}
+        FLOATING_TAGS: ${{ inputs.floating_tags }}
         DRY_RUN: ${{ inputs.dry_run }}
       run: |
         set -euo pipefail
@@ -48,11 +60,23 @@ runs:
           exit 1
         fi
 
+        if [ "$FLOATING_TAGS" != "true" ] && [ "$FLOATING_TAGS" != "false" ]; then
+          echo "::error::floating_tags must be true or false, got '${FLOATING_TAGS}'"
+          exit 1
+        fi
+
         IFS='.' read -r major_num minor_num _ <<< "$VERSION"
 
         full="${TAG_PREFIX}${VERSION}"
         minor="${TAG_PREFIX}${major_num}.${minor_num}"
         major="${TAG_PREFIX}${major_num}"
+
+        # Reported as empty rather than as a name that was never published:
+        # a caller must not pin a tag this run did not create.
+        if [ "$FLOATING_TAGS" = "false" ]; then
+          minor=""
+          major=""
+        fi
 
         {
           echo "full=${full}"
@@ -76,11 +100,18 @@ runs:
         fi
 
         if [ "$DRY_RUN" = "true" ]; then
-          echo "Dry run - would publish ${full}, ${minor}, ${major} at ${GITHUB_SHA}"
+          if [ "$FLOATING_TAGS" = "true" ]; then
+            plain="${full}, ${minor} and ${major}"
+            marked="\`${full}\`, \`${minor}\` and \`${major}\`"
+          else
+            plain="${full}"
+            marked="\`${full}\`"
+          fi
+          echo "Dry run - would publish ${plain} at ${GITHUB_SHA}"
           {
             echo "### Dry run"
             echo ""
-            echo "Would publish \`${full}\`, \`${minor}\` and \`${major}\`."
+            echo "Would publish ${marked}."
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
         fi
@@ -89,14 +120,17 @@ runs:
         git config user.email "github-actions[bot]@users.noreply.github.com"
 
         git tag --annotate "$full" -m "Release ${VERSION}"
-        git tag --annotate --force "$minor" -m "Release ${VERSION}"
-        git tag --annotate --force "$major" -m "Release ${VERSION}"
-
-        # The floating tags move backwards as well as forwards, so they need
-        # --force on the remote too.
         git push origin "$full"
-        git push --force origin "$minor"
-        git push --force origin "$major"
+
+        if [ "$FLOATING_TAGS" = "true" ]; then
+          git tag --annotate --force "$minor" -m "Release ${VERSION}"
+          git tag --annotate --force "$major" -m "Release ${VERSION}"
+
+          # The floating tags move backwards as well as forwards, so they need
+          # --force on the remote too.
+          git push --force origin "$minor"
+          git push --force origin "$major"
+        fi
 
         {
           echo "### Release ${VERSION}"
@@ -104,6 +138,8 @@ runs:
           echo "| Tag | Points at | Moves |"
           echo "|---|---|---|"
           echo "| \`${full}\` | \`${GITHUB_SHA::7}\` | never |"
-          echo "| \`${minor}\` | \`${GITHUB_SHA::7}\` | with every patch |"
-          echo "| \`${major}\` | \`${GITHUB_SHA::7}\` | with every compatible release |"
+          if [ "$FLOATING_TAGS" = "true" ]; then
+            echo "| \`${minor}\` | \`${GITHUB_SHA::7}\` | with every patch |"
+            echo "| \`${major}\` | \`${GITHUB_SHA::7}\` | with every compatible release |"
+          fi
         } >> "$GITHUB_STEP_SUMMARY"
