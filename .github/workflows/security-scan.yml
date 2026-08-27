@@ -24,4 +24,4 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: florian-hild/reusable-workflows/.github/workflows/security-scan.yml@v1
+    uses: florian-hild/reusable-workflows/.github/workflows/security-scan.yml@472932839e3abe77c72b5759c75ad29cc210d223 # v2
