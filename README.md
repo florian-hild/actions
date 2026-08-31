@@ -4,7 +4,7 @@
 |---|---|
 | [`next-version`](next-version/) | Derive the next semantic version from git tags and commit subjects |
 | [`release-tags`](release-tags/) | Publish the immutable tag for a version, and optionally the floating ones |
-| [`path-changes`](path-changes/) | Report which path groups a push or pull request touched |
+| [`path-changes`](path-changes/) | Report which path groups a push or pull request touched, or discover the projects under a root and report which changed |
 
 ## Versioning
 

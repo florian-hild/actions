@@ -1,16 +1,22 @@
 name: Path Changes
 description: |
-  Detects whether changed files match specified path groups and writes a boolean
-  output per group plus a combined 'results' JSON output.
+  Detects whether changed files match path groups and writes a boolean output
+  per group plus a combined 'results' JSON output.
 
-  Each group key is written individually to GITHUB_OUTPUT, so callers can access
-  results either as:
+  Groups are either given explicitly (paths input) or discovered from the git
+  index: every directory under root that contains a tracked file matching
+  marker, or every path truncated to its first depth segments. Discovery mode
+  adds all/changed/changed_dirs outputs and an optional capabilities map that
+  splits the changed projects by the files they contain.
+
+  Each group key is written individually to GITHUB_OUTPUT, so callers can
+  access results either as:
     steps.<id>.outputs.server          # direct boolean string "true"/"false"
     fromJSON(steps.<id>.outputs.results).server  # via JSON object
 
   Requires the repository to be checked out before calling this action.
-  fetch-depth: 0 is NOT required — the action fetches the base commit on demand
-  when it is not already present in the local clone.
+  fetch-depth: 0 is NOT required — the action fetches the base commit on
+  demand when it is not already present in the local clone.
 
 inputs:
   paths:
@@ -22,7 +28,48 @@ inputs:
           "server": ["server/**", ".github/workflows/server_build.yml"],
           "client": ["client/**"]
         }
-    required: true
+      Leave empty to discover the groups from the git index instead, via
+      marker or depth.
+    required: false
+    default: ""
+  root:
+    description: |
+      Directory to search for projects in discovery mode. The root itself is
+      never a project. Ignored when paths is set.
+    required: false
+    default: "."
+  marker:
+    description: |
+      Glob matched against the path relative to a candidate directory; the
+      directory is a project when at least one tracked file under it matches.
+      Examples: "pyproject.toml", "Makefile", "tests/**", "Containerfile".
+      Mutually exclusive with depth and with paths.
+    required: false
+    default: ""
+  depth:
+    description: |
+      Depth mode: every tracked file under root contributes its first `depth`
+      slash-separated segments as a project; a shallower file contributes its
+      whole path. Example: root "bash", depth 3 yields bash/bin/<name> and
+      bash/lib/<name>. Mutually exclusive with marker and with paths.
+    required: false
+    default: ""
+  include:
+    description: |
+      Space-separated glob patterns appended to every group, so a change to
+      one of them marks every group changed. Example: ".editorconfig".
+    required: false
+    default: ""
+  capabilities:
+    description: |
+      JSON object mapping a capability name to a list of globs matched against
+      the path relative to a project directory; the project has the capability
+      when at least one tracked file matches. Discovery mode only. Capability
+      names must be usable as GitHub expression property keys (letters,
+      digits, underscore, first character not a digit).
+      Example: {"test": ["tests/**"], "container": ["Containerfile"]}
+    required: false
+    default: ""
   base-ref:
     description: |
       Base commit reference or SHA to diff against.
@@ -40,6 +87,30 @@ outputs:
       JSON object mapping each group name to a boolean.
       Example: {"server": true, "client": false}
     value: ${{ steps.detect.outputs.results }}
+  all:
+    description: |
+      JSON array of all discovered project directories, sorted.
+      Discovery mode only; "[]" when groups were given explicitly.
+    value: ${{ steps.detect.outputs.all }}
+  changed:
+    description: |
+      JSON array of the discovered projects whose files changed.
+      Discovery mode only; "[]" when groups were given explicitly.
+    value: ${{ steps.detect.outputs.changed }}
+  changed_dirs:
+    description: |
+      The changed project directories, space-joined, ready to pass to an
+      input that takes space-separated paths.
+      Discovery mode only; empty when groups were given explicitly.
+    value: ${{ steps.detect.outputs.changed_dirs }}
+  capabilities_changed:
+    description: |
+      JSON object mapping each declared capability to the JSON array of
+      changed projects that have it. Every declared capability is present,
+      with an empty array when no changed project has it.
+      Discovery mode only; "{}" when groups were given explicitly.
+      Read one set as fromJSON(steps.<id>.outputs.capabilities_changed).test
+    value: ${{ steps.detect.outputs.capabilities_changed }}
 
 runs:
   using: composite
@@ -49,6 +120,11 @@ runs:
       shell: python3 {0}
       env:
         ACTION_PATHS: ${{ inputs.paths }}
+        ACTION_ROOT: ${{ inputs.root }}
+        ACTION_MARKER: ${{ inputs.marker }}
+        ACTION_DEPTH: ${{ inputs.depth }}
+        ACTION_INCLUDE: ${{ inputs.include }}
+        ACTION_CAPABILITIES: ${{ inputs.capabilities }}
         ACTION_BASE_REF: ${{ inputs.base-ref }}
       run: |
         import json
@@ -100,29 +176,158 @@ runs:
             return any(rx.match(f) for f in files for rx in compiled)
 
 
-        paths_config: dict = json.loads(os.environ["ACTION_PATHS"])
+        def ls_files(root: str) -> list:
+            """Tracked files under root, so untracked local junk never becomes a group."""
+            proc = subprocess.run(
+                ["git", "ls-files", "--", root],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return [line for line in proc.stdout.splitlines() if line]
 
-        # Group names become output keys. "results" is taken by this action's
-        # own JSON output, and anything with a newline could inject further
+
+        def fail(message: str):
+            raise SystemExit(f"::error::{message}")
+
+
+        def load_json(name: str, raw: str):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as exc:
+                fail(f"{name} is not valid JSON: {exc}")
+
+
+        # Group names become output keys. The fixed outputs of this action
+        # take precedence, and anything with a newline could inject further
         # outputs, so both are rejected instead of silently colliding.
-        RESERVED = {"results"}
-        for group in paths_config:
+        RESERVED = {"results", "all", "changed", "changed_dirs", "capabilities_changed"}
+
+
+        def check_group_name(group: str):
             if group in RESERVED:
-                raise SystemExit(
-                    f"::error::group name '{group}' is reserved by this action"
-                )
+                fail(f"group name '{group}' is reserved by this action")
             if not group or any(c in group for c in "\r\n=") or group.strip() != group:
-                raise SystemExit(
-                    f"::error::group name {group!r} must not be empty or contain "
+                fail(
+                    f"group name {group!r} must not be empty or contain "
                     "newlines, '=' or surrounding whitespace"
                 )
+
+
+        # --- inputs and mode resolution -------------------------------------
+
+        explicit = os.environ.get("ACTION_PATHS", "").strip() != ""
+        marker = os.environ.get("ACTION_MARKER", "").strip()
+        depth = os.environ.get("ACTION_DEPTH", "").strip()
+        root = os.environ.get("ACTION_ROOT", ".").strip().rstrip("/") or "."
+        include_patterns = os.environ.get("ACTION_INCLUDE", "").split()
+        capabilities_raw = os.environ.get("ACTION_CAPABILITIES", "").strip()
+
+        if explicit and (marker or depth):
+            fail("paths cannot be combined with marker or depth")
+        if not explicit and marker and depth:
+            fail("marker and depth are mutually exclusive")
+        if not explicit and not marker and not depth:
+            fail("provide either paths, marker or depth")
+        if explicit and capabilities_raw:
+            fail("capabilities need discovery mode (marker or depth, not paths)")
+        if depth and (not depth.isdigit() or int(depth) < 1):
+            fail(f"depth must be a positive integer, got {depth!r}")
+
+        # --- explicit groups -------------------------------------------------
+
+        paths_config: dict = {}
+        projects: list = []
+        capabilities_per_project: dict = {}
+
+        if explicit:
+            paths_config = load_json("paths", os.environ["ACTION_PATHS"])
+            for group in paths_config:
+                check_group_name(group)
+            if include_patterns:
+                for group in paths_config:
+                    paths_config[group] = list(paths_config[group]) + include_patterns
+
+        # --- discovery ------------------------------------------------------
+
+        else:
+            files = ls_files(root)
+
+            if marker:
+                marker_rx = re.compile(glob_to_regex(marker))
+                found = set()
+                for file in files:
+                    parts = file.split("/")
+                    for i in range(1, len(parts)):
+                        candidate = "/".join(parts[:i])
+                        if candidate == root:
+                            continue  # the root itself is never a project
+                        relative = "/".join(parts[i:])
+                        if marker_rx.match(relative):
+                            found.add(candidate)
+                projects = sorted(found)
+            else:
+                d = int(depth)
+                found = set()
+                for file in files:
+                    parts = file.split("/")
+                    found.add("/".join(parts[:d]) if len(parts) >= d else file)
+                projects = sorted(found)
+
+            if not projects:
+                print(f"::warning::No projects found under '{root}'")
+
+            if capabilities_raw:
+                raw = load_json("capabilities", capabilities_raw)
+                if not isinstance(raw, dict):
+                    fail("capabilities must be a JSON object")
+                for name, patterns in raw.items():
+                    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                        fail(
+                            f"capability name {name!r} must be usable as a "
+                            "GitHub expression property key "
+                            "(letters, digits, underscore, first not a digit)"
+                        )
+                    if isinstance(patterns, str):
+                        patterns = [patterns]
+                    if not patterns:
+                        fail(f"capability {name!r} has no patterns")
+
+                compiled_caps = {
+                    name: [re.compile(glob_to_regex(p)) for p in patterns]
+                    for name, patterns in raw.items()
+                }
+                capabilities_per_project = {name: set() for name in raw}
+                for project in projects:
+                    prefix = project + "/"
+                    for file in files:
+                        if file == project:
+                            relative = ""
+                        elif file.startswith(prefix):
+                            relative = file[len(prefix) :]
+                        else:
+                            continue
+                        for name, rxs in compiled_caps.items():
+                            if project in capabilities_per_project[name]:
+                                continue
+                            if any(rx.match(relative) for rx in rxs):
+                                capabilities_per_project[name].add(project)
+
+            # The bare directory pattern also catches a shell script placed
+            # directly in a project directory in depth mode, where a project
+            # can be a file path.
+            paths_config = {
+                f"p{i}": [project + "/**", project, *include_patterns]
+                for i, project in enumerate(projects)
+            }
+
+        # --- base ref detection (mirrors dorny/paths-filter) ----------------
+
         base_ref: str = os.environ.get("ACTION_BASE_REF", "").strip()
 
         event_name: str = os.environ.get("GITHUB_EVENT_NAME", "")
         event_path: str = os.environ.get("GITHUB_EVENT_PATH", "")
 
-        # Auto-detect the base ref from the GitHub event payload, mirroring
-        # how dorny/paths-filter resolves the comparison target.
         if not base_ref:
             event: dict = {}
             if event_path and os.path.isfile(event_path):
@@ -134,75 +339,107 @@ runs:
             elif event_name == "push":
                 base_ref = event.get("before", "")
 
-        # Scheduled / manual runs have no meaningful base — mark everything changed.
-        no_diff_events = {"schedule", "workflow_dispatch"}
-        if event_name in no_diff_events or not base_ref:
-            if event_name in no_diff_events:
+        # Scheduled / manual runs have no meaningful base — mark everything
+        # changed, so the changed-project outputs stay usable.
+        no_diff = event_name in {"schedule", "workflow_dispatch"} or not base_ref
+        results: dict = {}
+        changed_files: list = []
+
+        if no_diff:
+            if event_name in {"schedule", "workflow_dispatch"}:
                 print(
                     f"Event '{event_name}' has no base commit — marking all groups as changed."
                 )
             else:
                 print("::warning::Could not determine base ref — marking all groups as changed.")
-
-            github_output = require_github_output()
             results = {group: True for group in paths_config}
-            with open(github_output, "a") as fh:
-                for group in paths_config:
-                    fh.write(f"{group}=true\n")
-                fh.write(f"results={json.dumps(results)}\n")
-            print(f"results: {json.dumps(results)}")
-            raise SystemExit(0)
+        else:
+            # If the base commit is not in the local shallow clone (e.g.
+            # default fetch-depth: 1), fetch just that single commit on
+            # demand so that git diff works without requiring fetch-depth: 0.
+            try:
+                subprocess.run(
+                    ["git", "cat-file", "-e", f"{base_ref}^{{commit}}"],
+                    capture_output=True,
+                    check=True,
+                )
+            except subprocess.CalledProcessError:
+                print(f"Base commit not in local history — fetching {base_ref} …")
+                subprocess.run(
+                    ["git", "fetch", "origin", base_ref, "--depth=1"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                base_ref = "FETCH_HEAD"
 
-        # Collect changed file paths.
-        # If the base commit is not in the local shallow clone (e.g. default
-        # fetch-depth: 1), fetch just that single commit on demand so that
-        # git diff works without requiring fetch-depth: 0.
-        try:
-            subprocess.run(
-                ["git", "cat-file", "-e", f"{base_ref}^{{commit}}"],
-                capture_output=True,
-                check=True,
-            )
-        except subprocess.CalledProcessError:
-            print(f"Base commit not in local history — fetching {base_ref} …")
-            subprocess.run(
-                ["git", "fetch", "origin", base_ref, "--depth=1"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            base_ref = "FETCH_HEAD"
+            try:
+                proc = subprocess.run(
+                    ["git", "diff", "--name-only", base_ref, "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                changed_files = [line for line in proc.stdout.splitlines() if line]
+            except subprocess.CalledProcessError as exc:
+                print(
+                    f"::error::git diff failed (exit {exc.returncode}): {exc.stderr.strip()}"
+                )
+                raise SystemExit(1)
 
-        try:
-            proc = subprocess.run(
-                ["git", "diff", "--name-only", base_ref, "HEAD"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            changed_files = [line for line in proc.stdout.splitlines() if line]
-        except subprocess.CalledProcessError as exc:
-            print(
-                f"::error::git diff failed (exit {exc.returncode}): {exc.stderr.strip()}"
-            )
-            raise SystemExit(1)
+            print("Changed files detected:")
+            for f in changed_files:
+                print(f"  {f}")
 
-        print("Changed files detected:")
-        for f in changed_files:
-            print(f"  {f}")
+            results = {
+                group: any_file_matches(changed_files, patterns)
+                for group, patterns in paths_config.items()
+            }
+
+        # --- outputs --------------------------------------------------------
+
+        changed = []
+        capabilities_changed: dict = {}
+
+        if not explicit:
+            changed = [
+                project
+                for i, project in enumerate(projects)
+                if results.get(f"p{i}")
+            ]
+            capabilities_changed = {
+                name: sorted(
+                    project for project in changed if project in member
+                )
+                for name, member in capabilities_per_project.items()
+            }
+
+        print("\nPath group results:")
+        for group in paths_config:
+            print(f"  {group}: {'true' if results[group] else 'false'}")
+        if not explicit:
+            if projects:
+                print(f"\nProject(s): {json.dumps(projects)}")
+            if changed:
+                print(f"Changed project(s): {json.dumps(changed)}")
+            if capabilities_changed:
+                print(f"Changed capabilities: {json.dumps(capabilities_changed)}")
 
         github_output = require_github_output()
-        results: dict = {}
-
         with open(github_output, "a") as fh:
-            print("\nPath group results:")
-            for group, patterns in paths_config.items():
-                matched = any_file_matches(changed_files, patterns)
-                results[group] = matched
-                value = "true" if matched else "false"
-                print(f"  {group}: {value}")
-                fh.write(f"{group}={value}\n")
-
+            for group in paths_config:
+                fh.write(f"{group}={'true' if results[group] else 'false'}\n")
             fh.write(f"results={json.dumps(results)}\n")
+
+            if explicit:
+                fh.write("all=[]\n")
+                fh.write("changed=[]\n")
+                fh.write("changed_dirs=\n")
+                fh.write("capabilities_changed={}\n")
+            else:
+                fh.write(f"all={json.dumps(projects)}\n")
+                fh.write(f"changed={json.dumps(changed)}\n")
+                fh.write(f"changed_dirs={' '.join(changed)}\n")
+                fh.write(f"capabilities_changed={json.dumps(capabilities_changed)}\n")
 
         print(f"\nresults: {json.dumps(results)}")
