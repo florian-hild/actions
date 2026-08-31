@@ -365,12 +365,22 @@ runs:
                 )
             except subprocess.CalledProcessError:
                 print(f"Base commit not in local history — fetching {base_ref} …")
-                subprocess.run(
+                fetch = subprocess.run(
                     ["git", "fetch", "origin", base_ref, "--depth=1"],
                     capture_output=True,
                     text=True,
-                    check=True,
                 )
+                if fetch.returncode != 0:
+                    # The usual cause on a private repository: the caller
+                    # set persist-credentials: false, so this fetch is
+                    # anonymous and the server refuses it. Without the
+                    # stderr the runner log shows a bare exit 128 and no
+                    # hint of what to change.
+                    print(
+                        "::error::git fetch of the base commit failed (exit"
+                        f" {fetch.returncode}): {fetch.stderr.strip()}"
+                    )
+                    raise SystemExit(1)
                 base_ref = "FETCH_HEAD"
 
             try:

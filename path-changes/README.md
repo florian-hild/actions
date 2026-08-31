@@ -90,6 +90,12 @@ the webhook payload:
 
 You can override it only when you need a custom comparison target.
 
+The base commit is not part of a default depth-1 checkout, so the action
+fetches it on demand (`git fetch origin <sha> --depth=1`). That fetch needs
+the checkout's credentials to persist: on a private repository with
+`persist-credentials: false` the fetch is anonymous and fails — either leave
+the credentials in place or check out with `fetch-depth: 0`.
+
 Example:
 
 ```yaml
